@@ -32,6 +32,8 @@ class AccelerationRuntime:
             return self.config.accelerate_clustering
         if stage == "manifold":
             return self.config.accelerate_manifold
+        if stage == "hmm":
+            return self.config.accelerate_hmm
         return False
 
     def record_stage(self, stage: str, accelerated: bool, detail: str) -> None:

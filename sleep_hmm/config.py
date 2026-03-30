@@ -115,6 +115,7 @@ class AccelerationConfig:
     accelerate_features: bool = True
     accelerate_clustering: bool = True
     accelerate_manifold: bool = True
+    accelerate_hmm: bool = True
 
 
 @dataclass

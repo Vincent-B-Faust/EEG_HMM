@@ -571,6 +571,14 @@ def _build_signal_levels(signal: np.ndarray, max_bins: int = 180_000, n_levels: 
     }
 
 
+def _spectrum_sample_indices(n_bins: int, max_bins: int = 160) -> np.ndarray:
+    if n_bins <= 0:
+        return np.array([], dtype=int)
+    if n_bins <= max_bins:
+        return np.arange(n_bins, dtype=int)
+    return np.unique(np.linspace(0, n_bins - 1, max_bins, dtype=int))
+
+
 def create_interactive_session_view(
     session_name: str,
     source_name: str,
@@ -578,6 +586,9 @@ def create_interactive_session_view(
     windows: WindowResult,
     embedding: np.ndarray,
     manifold_method: str,
+    freqs: np.ndarray,
+    eeg_spectra: np.ndarray,
+    average_spectra_by_method: dict[str, np.ndarray],
     labels_by_method: dict[str, np.ndarray],
     output_dir: Path,
     default_method: str,
@@ -586,6 +597,22 @@ def create_interactive_session_view(
     all_labels = np.concatenate([labels.astype(int) for labels in labels_by_method.values()]) if labels_by_method else np.array([0], dtype=int)
     n_states = int(all_labels.max()) + 1 if all_labels.size else 1
     palette = [PALETTE[idx % len(PALETTE)] for idx in range(max(n_states, 1))]
+    freqs_array = np.asarray(freqs, dtype=float).reshape(-1)
+    spectra_array = np.asarray(eeg_spectra, dtype=float)
+    if spectra_array.ndim == 1:
+        spectra_array = spectra_array.reshape(1, -1)
+    spectrum_indices = _spectrum_sample_indices(freqs_array.size, max_bins=160)
+    spectra_freqs = freqs_array[spectrum_indices] if spectrum_indices.size else np.array([], dtype=float)
+    epoch_spectra = spectra_array[:, spectrum_indices] if spectrum_indices.size and spectra_array.size else np.empty((0, 0), dtype=float)
+    cluster_mean_spectra = {}
+    for method_name, spectra in average_spectra_by_method.items():
+        method_spectra = np.asarray(spectra, dtype=float)
+        if method_spectra.ndim == 1:
+            method_spectra = method_spectra.reshape(1, -1)
+        if spectrum_indices.size and method_spectra.size:
+            cluster_mean_spectra[method_name] = method_spectra[:, spectrum_indices].round(6).tolist()
+        else:
+            cluster_mean_spectra[method_name] = []
 
     payload = {
         "session_name": session_name,
@@ -602,6 +629,11 @@ def create_interactive_session_view(
         "default_background_method": default_method if default_method in labels_by_method else next(iter(labels_by_method), "kmeans"),
         "cluster_colors": palette,
         "methods": {name: labels.astype(int).tolist() for name, labels in labels_by_method.items()},
+        "spectra": {
+            "freqs": spectra_freqs.round(6).tolist(),
+            "epochs": epoch_spectra.round(6).tolist() if epoch_spectra.size else [],
+            "cluster_means": cluster_mean_spectra,
+        },
         "signals": {
             "eeg": {
                 "title": "EEG",
@@ -824,7 +856,11 @@ def create_interactive_session_view(
         </div>
         <div class="panel">
           <p class="panel-label">Cluster Scatter</p>
-          <canvas id="cluster-canvas" height="210"></canvas>
+          <canvas id="cluster-canvas" height="380"></canvas>
+        </div>
+        <div class="panel">
+          <p class="panel-label">Spectrum</p>
+          <canvas id="spectrum-canvas" height="240"></canvas>
         </div>
       </div>
 
@@ -859,7 +895,7 @@ def create_interactive_session_view(
           <tbody id="method-state-body"></tbody>
         </table>
         <div class="hint">
-          Click a point on the manifold scatter to trace that epoch back to the raw EEG/EMG panels. Mouse wheel zooms around the cursor position, and dragging inside EEG/EMG panels pans the time range synchronously.
+          Click a point on the manifold scatter to trace that epoch back to the raw EEG/EMG panels. The spectrum panel overlays the selected epoch with the active cluster mean. Mouse wheel zooms around the cursor position, and dragging inside EEG/EMG panels pans the time range synchronously.
         </div>
       </aside>
     </div>
@@ -936,6 +972,12 @@ def create_interactive_session_view(
     DATA.signals.eeg = decodeSignalLevels(DATA.signals.eeg);
     DATA.signals.emg = decodeSignalLevels(DATA.signals.emg);
     DATA.embedding = (DATA.embedding || []).map((item) => [Number(item[0]) || 0, Number(item[1]) || 0]);
+    DATA.spectra = DATA.spectra || { freqs: [], epochs: [], cluster_means: {} };
+    DATA.spectra.freqs = (DATA.spectra.freqs || []).map((value) => Number(value) || 0);
+    DATA.spectra.epochs = (DATA.spectra.epochs || []).map((row) => row.map((value) => Number(value) || 0));
+    Object.keys(DATA.spectra.cluster_means || {}).forEach((methodName) => {
+      DATA.spectra.cluster_means[methodName] = (DATA.spectra.cluster_means[methodName] || []).map((row) => row.map((value) => Number(value) || 0));
+    });
 
     const manifoldBounds = (() => {
       if (!DATA.embedding.length) {
@@ -975,6 +1017,7 @@ def create_interactive_session_view(
       eeg: document.getElementById("eeg-canvas"),
       emg: document.getElementById("emg-canvas"),
       cluster: document.getElementById("cluster-canvas"),
+      spectrum: document.getElementById("spectrum-canvas"),
     };
 
     const emgPanel = document.getElementById("emg-panel");
@@ -1068,6 +1111,22 @@ def create_interactive_session_view(
         bottom: height - 22,
         width: Math.max(10, width - leftMargin - 12),
         height: Math.max(10, height - 36),
+      };
+    }
+
+    function currentSquarePlotRect(width, height, leftMargin, rightMargin = 18, topMargin = 28, bottomMargin = 26) {
+      const availableWidth = Math.max(40, width - leftMargin - rightMargin);
+      const availableHeight = Math.max(40, height - topMargin - bottomMargin);
+      const side = Math.max(40, Math.min(availableWidth, availableHeight));
+      const offsetX = (availableWidth - side) / 2;
+      const offsetY = (availableHeight - side) / 2;
+      return {
+        left: leftMargin + offsetX,
+        right: leftMargin + offsetX + side,
+        top: topMargin + offsetY,
+        bottom: topMargin + offsetY + side,
+        width: side,
+        height: side,
       };
     }
 
@@ -1184,7 +1243,7 @@ def create_interactive_session_view(
     function drawClusterPanel() {
       const { ctx, width, height } = setupCanvas(canvases.cluster);
       ctx.clearRect(0, 0, width, height);
-      const plot = currentPlotRect(width, height, 46);
+      const plot = currentSquarePlotRect(width, height, 58);
       const labels = getLabels(state.backgroundMethod);
       state.scatterPoints = [];
 
@@ -1245,14 +1304,98 @@ def create_interactive_session_view(
 
       ctx.fillStyle = "#10212b";
       ctx.font = "12px Segoe UI";
-      ctx.fillText(`Scatter colored by ${state.backgroundMethod}`, plot.left, 12);
+      ctx.fillText(`Scatter colored by ${state.backgroundMethod}`, plot.left, 16);
       ctx.fillStyle = "#5f6b76";
-      ctx.fillText(`Manifold: ${DATA.manifold_method}`, plot.left + 150, 12);
+      ctx.fillText(`Manifold: ${DATA.manifold_method}`, Math.min(plot.right - 110, plot.left + 180), 16);
       ctx.fillText("Dim 1", plot.left, height - 4);
       ctx.save();
       ctx.translate(12, plot.bottom);
       ctx.rotate(-Math.PI / 2);
       ctx.fillText("Dim 2", 0, 0);
+      ctx.restore();
+    }
+
+    function drawSpectrumLine(ctx, plot, freqs, values, yMax, color, lineWidth, alpha) {
+      if (!freqs.length || !values.length) return;
+      const freqMin = freqs[0];
+      const freqMax = freqs[freqs.length - 1];
+      if (freqMax <= freqMin) return;
+      ctx.save();
+      ctx.strokeStyle = hexToRgba(color, alpha);
+      ctx.lineWidth = lineWidth;
+      ctx.beginPath();
+      let moved = false;
+      for (let idx = 0; idx < freqs.length && idx < values.length; idx += 1) {
+        const x = plot.left + ((freqs[idx] - freqMin) / (freqMax - freqMin)) * plot.width;
+        const y = plot.bottom - (Math.max(values[idx], 0) / yMax) * plot.height;
+        if (!moved) {
+          ctx.moveTo(x, y);
+          moved = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawSpectrumPanel() {
+      const { ctx, width, height } = setupCanvas(canvases.spectrum);
+      ctx.clearRect(0, 0, width, height);
+      const plot = currentPlotRect(width, height, 56);
+      ctx.strokeStyle = "rgba(16,33,43,0.12)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(plot.left, plot.top, plot.width, plot.height);
+
+      const freqs = DATA.spectra.freqs || [];
+      const epochSpectra = DATA.spectra.epochs || [];
+      if (!freqs.length || !epochSpectra.length) {
+        ctx.fillStyle = "#5f6b76";
+        ctx.font = "13px Segoe UI";
+        ctx.fillText("No EEG spectrum data available.", plot.left + 12, plot.top + 20);
+        return;
+      }
+
+      const epochIdx = Math.min(state.selectedEpoch, epochSpectra.length - 1);
+      const labels = getLabels(state.backgroundMethod);
+      const clusterState = labels[epochIdx] || 0;
+      const methodMeans = (DATA.spectra.cluster_means || {})[state.backgroundMethod] || [];
+      const selectedSpectrum = epochSpectra[epochIdx] || [];
+      const clusterMean = methodMeans[clusterState] || [];
+
+      let yMax = 1e-6;
+      selectedSpectrum.forEach((value) => { if (value > yMax) yMax = value; });
+      clusterMean.forEach((value) => { if (value > yMax) yMax = value; });
+      methodMeans.forEach((row) => row.forEach((value) => { if (value > yMax) yMax = value; }));
+      yMax *= 1.08;
+
+      ctx.strokeStyle = "rgba(95,107,118,0.16)";
+      ctx.lineWidth = 1;
+      for (let step = 0; step <= 4; step += 1) {
+        const y = plot.bottom - (step / 4) * plot.height;
+        ctx.beginPath();
+        ctx.moveTo(plot.left, y);
+        ctx.lineTo(plot.right, y);
+        ctx.stroke();
+      }
+
+      methodMeans.forEach((row, stateIndex) => {
+        drawSpectrumLine(ctx, plot, freqs, row, yMax, DATA.cluster_colors[stateIndex % DATA.cluster_colors.length], 1.2, stateIndex === clusterState ? 0.22 : 0.10);
+      });
+      drawSpectrumLine(ctx, plot, freqs, clusterMean, yMax, DATA.cluster_colors[clusterState % DATA.cluster_colors.length], 2.2, 0.95);
+      drawSpectrumLine(ctx, plot, freqs, selectedSpectrum, yMax, "#10212b", 2.0, 0.95);
+
+      ctx.fillStyle = "#10212b";
+      ctx.font = "12px Segoe UI";
+      ctx.fillText(`Selected epoch spectrum vs ${state.backgroundMethod} cluster mean (S${clusterState})`, plot.left, 12);
+      ctx.fillStyle = "#5f6b76";
+      ctx.fillText(`0-${freqs[freqs.length - 1].toFixed(1)} Hz`, Math.max(plot.left, plot.right - 70), 12);
+      ctx.fillText("0 Hz", plot.left, height - 4);
+      ctx.fillText(`${freqs[freqs.length - 1].toFixed(1)} Hz`, Math.max(plot.left, plot.right - 44), height - 4);
+      ctx.save();
+      ctx.translate(14, plot.bottom);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText(`Power (max ${yMax.toFixed(2)})`, 0, 0);
       ctx.restore();
     }
 
@@ -1326,6 +1469,7 @@ def create_interactive_session_view(
       drawSignalPanel(canvases.eeg, DATA.signals.eeg);
       if (DATA.signals.emg) drawSignalPanel(canvases.emg, DATA.signals.emg);
       drawClusterPanel();
+      drawSpectrumPanel();
       updateInfo();
     }
 

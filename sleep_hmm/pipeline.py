@@ -115,6 +115,7 @@ def run_pipeline(
         features=feature_result.scaled_table.to_numpy(dtype=float),
         window_sec=cfg.windowing.window_sec,
         config=cfg.hmm,
+        runtime=runtime,
     )
 
     manifold_result = manifold(feature_result.scaled_table.to_numpy(dtype=float), cfg.manifold, runtime=runtime)
@@ -297,6 +298,9 @@ def run_pipeline(
         windows=windows,
         embedding=manifold_result.embedding,
         manifold_method=manifold_result.method_used,
+        freqs=feature_result.freqs,
+        eeg_spectra=feature_result.eeg_spectra,
+        average_spectra_by_method={name: method.average_spectra for name, method in clustering.methods.items()},
         labels_by_method=aligned_labels,
         output_dir=output_dir,
         default_method=alignment.reference_method,

@@ -54,7 +54,7 @@
 加速策略：
 
 - `backend="auto"` 时优先选择 `CUDA`，其次 `MPS`，否则回退 `CPU`
-- GPU 主要加速：批量特征提取、KMeans、GMM、PCA、Diffusion Map
+- GPU 主要加速：批量特征提取、KMeans、GMM、Gaussian HMM、PCA、Diffusion Map
 - 仍保留 CPU：滤波、层次聚类、部分评估和绘图
 
 命令行示例：
@@ -194,7 +194,8 @@ result = run_interactive(
 对文件输入，系统会在 `sessions/<输入文件名>/session_view.html` 生成一个自包含的交互式会话页面。打开后可查看：
 
 - 全长 EEG / EMG 时间轴
-- 基于降维流形的 cluster 散点图
+- 更易观察的方形布局 manifold cluster 散点图
+- 选中 epoch 的 EEG 频谱，以及当前 cluster 的平均频谱叠加
 - 与 cluster 颜色一致的原始信号背景标注
 - 同步缩放、平移和 epoch 追踪
 
@@ -202,7 +203,7 @@ result = run_interactive(
 
 - 鼠标滚轮：围绕光标位置缩放
 - 在 EEG / EMG 面板中拖动：同步平移时间范围
-- 点击 manifold 散点图中的任一点：在原始信号中高亮并在右侧信息面板显示该 epoch 的三种聚类标签
+- 点击 manifold 散点图中的任一点：在原始信号中高亮，并同步更新右侧标签信息和频谱面板
 - 点击 overview 面板：将当前视窗居中到对应时间位置
 
 ## 依赖

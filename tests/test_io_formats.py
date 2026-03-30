@@ -136,6 +136,8 @@ class IOFormatTestCase(unittest.TestCase):
             self.assertTrue((result.output_dir / "report.md").exists())
             self.assertTrue((result.output_dir / "session_view.html").exists())
             self.assertEqual(result.output_dir.name, "signals")
+            html_text = (result.output_dir / "session_view.html").read_text(encoding="utf-8")
+            self.assertIn("spectrum-canvas", html_text)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import numpy as np
 from scipy.special import logsumexp
 from scipy.spatial.distance import cdist
 
+from .acceleration import AccelerationRuntime
 from .config import HMMConfig
 from .types import HMMResult
 
@@ -207,10 +208,136 @@ def _fit_single_gaussian_hmm(features: np.ndarray, n_states: int, cfg: HMMConfig
     )
 
 
+def _log_gaussian_diag_torch(features: object, means: object, variances: object, torch_module: object) -> object:
+    safe_var = torch_module.clamp(variances, min=1e-12)
+    log_det = torch_module.sum(torch_module.log(2.0 * torch_module.pi * safe_var), dim=2)
+    diff = features.unsqueeze(0).unsqueeze(2) - means.unsqueeze(1)
+    quadratic = torch_module.sum((diff**2) / safe_var.unsqueeze(1), dim=3)
+    return -0.5 * (log_det.unsqueeze(1) + quadratic)
+
+
+def _forward_backward_torch(log_emission: object, initial: object, transition: object, torch_module: object) -> tuple[object, object, object]:
+    n_restarts, n_samples, _ = log_emission.shape
+    eps = max(float(torch_module.finfo(initial.dtype).tiny), 1e-30)
+    log_initial = torch_module.log(torch_module.clamp(initial, min=eps))
+    log_transition = torch_module.log(torch_module.clamp(transition, min=eps))
+
+    log_alpha = torch_module.empty_like(log_emission)
+    log_alpha[:, 0, :] = log_initial + log_emission[:, 0, :]
+    for t in range(1, n_samples):
+        scores = log_alpha[:, t - 1, :, None] + log_transition
+        log_alpha[:, t, :] = log_emission[:, t, :] + torch_module.logsumexp(scores, dim=1)
+
+    log_beta = torch_module.zeros_like(log_emission)
+    log_likelihood = torch_module.logsumexp(log_alpha[:, -1, :], dim=1)
+    xi_sum = torch_module.zeros_like(transition)
+    for t in range(n_samples - 2, -1, -1):
+        transition_term = log_transition + log_emission[:, t + 1, :].unsqueeze(1) + log_beta[:, t + 1, :].unsqueeze(1)
+        log_beta[:, t, :] = torch_module.logsumexp(transition_term, dim=2)
+        xi_sum = xi_sum + torch_module.exp(log_alpha[:, t, :, None] + transition_term - log_likelihood[:, None, None])
+
+    gamma = torch_module.exp(log_alpha + log_beta - log_likelihood[:, None, None])
+    return log_likelihood, gamma, xi_sum
+
+
+def _fit_batched_gaussian_hmm_torch(
+    features: np.ndarray,
+    n_states: int,
+    cfg: HMMConfig,
+    runtime: AccelerationRuntime,
+    seeds: list[int],
+) -> HMMResult:
+    torch = runtime.torch_module
+    if torch is None:
+        raise RuntimeError("Torch runtime is not available.")
+
+    initial_list = []
+    transition_list = []
+    means_list = []
+    variances_list = []
+    for seed in seeds:
+        initial, transition, means, variances = _initialize_gaussian_hmm(features, n_states, cfg, seed)
+        initial_list.append(initial)
+        transition_list.append(transition)
+        means_list.append(means)
+        variances_list.append(variances)
+
+    feature_tensor = runtime.tensor(np.asarray(features, dtype=float))
+    feature_sq_tensor = feature_tensor**2
+    initial_tensor = runtime.tensor(np.stack(initial_list, axis=0))
+    transition_tensor = runtime.tensor(np.stack(transition_list, axis=0))
+    means_tensor = runtime.tensor(np.stack(means_list, axis=0))
+    variances_tensor = runtime.tensor(np.stack(variances_list, axis=0))
+
+    previous_log_likelihood = None
+    log_likelihood = None
+    for _ in range(cfg.max_iterations):
+        log_emission = _log_gaussian_diag_torch(feature_tensor, means_tensor, variances_tensor, torch)
+        log_likelihood, gamma, xi_sum = _forward_backward_torch(log_emission, initial_tensor, transition_tensor, torch)
+
+        initial_tensor = torch.clamp(gamma[:, 0, :], min=cfg.transition_pseudocount)
+        initial_tensor = initial_tensor / torch.clamp(initial_tensor.sum(dim=1, keepdim=True), min=1e-12)
+
+        gamma_sum = gamma.sum(dim=1) + 1e-12
+        transition_tensor = xi_sum + cfg.transition_pseudocount
+        transition_tensor = transition_tensor / torch.clamp(transition_tensor.sum(dim=2, keepdim=True), min=1e-12)
+
+        weighted_sum = torch.einsum("rtk,tf->rkf", gamma, feature_tensor)
+        weighted_sq_sum = torch.einsum("rtk,tf->rkf", gamma, feature_sq_tensor)
+        means_tensor = weighted_sum / gamma_sum.unsqueeze(2)
+        variances_tensor = weighted_sq_sum / gamma_sum.unsqueeze(2) - means_tensor**2
+        variances_tensor = torch.clamp(variances_tensor, min=cfg.regularization)
+
+        if previous_log_likelihood is not None and torch.max(torch.abs(log_likelihood - previous_log_likelihood)).item() < cfg.tolerance:
+            break
+        previous_log_likelihood = log_likelihood.clone()
+
+    log_emission = _log_gaussian_diag_torch(feature_tensor, means_tensor, variances_tensor, torch)
+    log_likelihood, _, _ = _forward_backward_torch(log_emission, initial_tensor, transition_tensor, torch)
+    best_index = int(torch.argmax(log_likelihood).item())
+
+    chosen_initial = runtime.to_numpy(initial_tensor[best_index])
+    chosen_transition = runtime.to_numpy(transition_tensor[best_index])
+    chosen_means = runtime.to_numpy(means_tensor[best_index])
+    chosen_variances = runtime.to_numpy(variances_tensor[best_index])
+    chosen_emission = runtime.to_numpy(log_emission[best_index])
+    best_log_likelihood = float(runtime.to_numpy(log_likelihood[best_index]))
+
+    hidden_states = _viterbi(chosen_emission, chosen_initial, chosen_transition)
+    stationary = _stationary_distribution(chosen_transition)
+    run_labels, run_lengths = _run_lengths(hidden_states)
+
+    durations_sec: dict[int, np.ndarray] = {}
+    run_length_map: dict[int, np.ndarray] = {}
+    for state in range(n_states):
+        lengths = run_lengths[run_labels == state]
+        run_length_map[state] = lengths
+        durations_sec[state] = lengths.astype(float)
+
+    n_features = features.shape[1]
+    n_parameters = (n_states - 1) + n_states * (n_states - 1) + 2 * n_states * n_features
+    bic = -2.0 * best_log_likelihood + n_parameters * np.log(features.shape[0])
+
+    return HMMResult(
+        n_states=n_states,
+        hidden_states=hidden_states,
+        transition_matrix=chosen_transition,
+        initial_distribution=chosen_initial,
+        stationary_distribution=stationary,
+        means=chosen_means,
+        variances=chosen_variances,
+        log_likelihood=best_log_likelihood,
+        bic=float(bic),
+        durations_sec=durations_sec,
+        run_lengths=run_length_map,
+    )
+
+
 def hmm_analysis(
     features: np.ndarray,
     window_sec: float,
     config: HMMConfig | None = None,
+    runtime: AccelerationRuntime | None = None,
 ) -> dict[int, HMMResult]:
     cfg = config or HMMConfig()
     feature_matrix = np.asarray(features, dtype=float)
@@ -222,6 +349,29 @@ def hmm_analysis(
         raise ValueError("Only diagonal-covariance Gaussian HMM is currently implemented.")
 
     results: dict[int, HMMResult] = {}
+
+    if runtime is not None and runtime.should_accelerate("hmm", feature_matrix.shape[0]):
+        try:
+            for offset, n_states in enumerate(cfg.state_counts):
+                if n_states <= 1:
+                    raise ValueError("Each HMM state count must be greater than 1.")
+                seeds = [cfg.random_seed + offset * 1000 + restart for restart in range(cfg.n_restarts)]
+                best_result = _fit_batched_gaussian_hmm_torch(feature_matrix, n_states, cfg, runtime, seeds)
+                best_result.durations_sec = {
+                    state: durations.astype(float) * float(window_sec)
+                    for state, durations in best_result.run_lengths.items()
+                }
+                results[n_states] = best_result
+            runtime.record_stage(
+                "hmm",
+                True,
+                f"Batched torch Gaussian HMM EM on {runtime.device_used} for state counts {list(cfg.state_counts)}.",
+            )
+            return results
+        except Exception as exc:
+            runtime.record_stage("hmm", False, f"GPU Gaussian HMM fallback: {exc}")
+            results = {}
+
     for offset, n_states in enumerate(cfg.state_counts):
         if n_states <= 1:
             raise ValueError("Each HMM state count must be greater than 1.")
@@ -239,4 +389,7 @@ def hmm_analysis(
             for state, durations in best_result.run_lengths.items()
         }
         results[n_states] = best_result
+
+    if runtime is not None and "hmm" not in runtime.stage_results:
+        runtime.record_stage("hmm", False, "CPU Gaussian HMM EM with NumPy/Scipy forward-backward.")
     return results

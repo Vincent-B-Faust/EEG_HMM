@@ -27,6 +27,10 @@ class PipelineTestCase(unittest.TestCase):
             self.assertGreater(len(result.artifact_paths["figures"]), 5)
             self.assertEqual(len(result.artifact_paths["interactive"]), 1)
             self.assertIn("backend_used", result.runtime_info)
+            self.assertIn("hmm", result.runtime_info.get("stage_results", {}))
+            html_text = (result.output_dir / "session_view.html").read_text(encoding="utf-8")
+            self.assertIn("spectrum-canvas", html_text)
+            self.assertIn("Selected epoch spectrum", html_text)
 
 
 if __name__ == "__main__":

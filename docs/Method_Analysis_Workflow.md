@@ -118,7 +118,7 @@ The pipeline automatically exports intermediate data tables, figures, and report
 
 ## 13. GPU Acceleration and Multi-Platform Compatibility
 
-The implementation supports optional GPU acceleration for computationally intensive stages. On Apple Silicon devices such as the MacBook Air M3, acceleration is available through `PyTorch + MPS`. On Windows systems equipped with NVIDIA GPUs such as the RTX 5070 Ti, acceleration is available through `PyTorch + CUDA`. In environments without GPU support or without an installed PyTorch runtime, the pipeline falls back automatically to a NumPy-based CPU implementation. GPU acceleration currently targets batched feature computation, KMeans, Gaussian mixture fitting, and selected manifold operations, while Gaussian HMM fitting, signal filtering, hierarchical clustering, and figure generation remain CPU-based in the current version.
+The implementation supports optional GPU acceleration for computationally intensive stages. On Apple Silicon devices such as the MacBook Air M3, acceleration is available through `PyTorch + MPS`. On Windows systems equipped with NVIDIA GPUs such as the RTX 5070 Ti, acceleration is available through `PyTorch + CUDA`. In environments without GPU support or without an installed PyTorch runtime, the pipeline falls back automatically to a NumPy-based CPU implementation. GPU acceleration currently targets batched feature computation, KMeans, Gaussian mixture fitting, Gaussian HMM fitting, and selected manifold operations, while signal filtering, hierarchical clustering, and figure generation remain CPU-based in the current version.
 
 ## 14. Reproducibility
 
