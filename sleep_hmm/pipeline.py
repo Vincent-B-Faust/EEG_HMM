@@ -16,6 +16,7 @@ from .preprocessing import preprocess
 from .types import PipelineResult, SignalBundle
 from .utils import ensure_dir, save_json
 from .visualization import (
+    create_interactive_session_view,
     plot_alignment_matrices,
     plot_cluster_outputs,
     plot_comparison_outputs,
@@ -288,6 +289,15 @@ def run_pipeline(
         threshold_summary=pd.DataFrame(threshold_compare_rows),
         output_dir=figures_dir,
         dpi=cfg.output.figure_dpi,
+    )
+    artifacts["interactive"] = create_interactive_session_view(
+        session_name=output_dir.name,
+        source_name=cfg.input.filename or output_dir.name,
+        preprocess_result=preprocess_result,
+        windows=windows,
+        labels_by_method=aligned_labels,
+        output_dir=output_dir,
+        default_method=alignment.reference_method,
     )
 
     artifacts["report"] = [

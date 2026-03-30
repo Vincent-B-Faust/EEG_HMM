@@ -6,6 +6,7 @@ from .config import InputConfig, PipelineConfig
 from .io import load_signals
 from .pipeline import run_pipeline
 from .types import PipelineResult
+from .utils import sanitize_session_name
 
 
 def apply_compatibility_settings(config: PipelineConfig, signal_length: int, fs: float) -> PipelineConfig:
@@ -35,7 +36,7 @@ def build_compatible_config(
     k_user: int = 3,
     window_size: int | None = None,
     overlap: int | None = None,
-    output_dir: str | Path = "outputs",
+    output_dir: str | Path = "sessions",
     feature_mode: str = "full",
     feature_scaling: str = "zscore",
     manifold_method: str = "umap",
@@ -81,6 +82,11 @@ def build_compatible_config(
 def run_file_pipeline(filename: str | Path, fs: float | None = None, config: PipelineConfig | None = None) -> PipelineResult:
     cfg = config or PipelineConfig()
     cfg.input.filename = str(filename)
+    source = Path(filename)
+    session_name = sanitize_session_name(source.stem)
+    base_output_dir = Path(cfg.output.output_dir)
+    if base_output_dir.name != session_name:
+        cfg.output.output_dir = base_output_dir / session_name
     bundle = load_signals(filename, fs=fs, config=cfg.input)
     cfg = apply_compatibility_settings(cfg, signal_length=len(bundle.eeg), fs=bundle.fs)
     return run_pipeline(eeg=bundle.eeg, emg=bundle.emg, fs=bundle.fs, config=cfg)
@@ -93,7 +99,7 @@ def run_interactive(
     k_user: int = 3,
     window_size: int | None = None,
     overlap: int | None = None,
-    output_dir: str | Path = "notebook_outputs",
+    output_dir: str | Path = "sessions",
     feature_mode: str = "full",
     feature_scaling: str = "zscore",
     manifold_method: str = "umap",

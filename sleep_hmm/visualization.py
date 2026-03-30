@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import html
+import json
 import os
 import warnings
 from pathlib import Path
@@ -498,3 +501,850 @@ def plot_comparison_outputs(
         fig.colorbar(mesh, ax=ax, shrink=0.7)
         paths.append(_finalize(fig, output_dir / "comparison_thresholds.png", dpi))
     return paths
+
+
+def _encode_int16_base64(values: np.ndarray) -> str:
+    return base64.b64encode(np.asarray(values, dtype="<i2").tobytes()).decode("ascii")
+
+
+def _quantize_signal(values: np.ndarray, value_min: float, value_max: float) -> np.ndarray:
+    scale = value_max - value_min
+    if scale <= 1e-12:
+        return np.zeros(values.shape, dtype=np.int16)
+    normalized = (values - value_min) / scale
+    quantized = np.round(normalized * 65535.0 - 32768.0)
+    return np.clip(quantized, -32768, 32767).astype(np.int16)
+
+
+def _signal_minmax(signal: np.ndarray, block_size: int) -> tuple[np.ndarray, np.ndarray]:
+    n_blocks = int(np.ceil(signal.size / block_size))
+    if n_blocks <= 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+    padded_length = n_blocks * block_size
+    if padded_length == signal.size:
+        padded = signal
+    else:
+        padded = np.pad(signal, (0, padded_length - signal.size), mode="edge")
+    reshaped = padded.reshape(n_blocks, block_size)
+    return reshaped.min(axis=1), reshaped.max(axis=1)
+
+
+def _build_signal_levels(signal: np.ndarray, max_bins: int = 180_000, n_levels: int = 4) -> dict[str, object]:
+    signal = np.asarray(signal, dtype=float).reshape(-1)
+    if signal.size == 0:
+        return {
+            "sample_count": 0,
+            "value_min": 0.0,
+            "value_max": 0.0,
+            "levels": [],
+        }
+
+    value_min = float(np.min(signal))
+    value_max = float(np.max(signal))
+    finest_block = max(1, int(np.ceil(signal.size / max_bins)))
+    block_sizes: list[int] = []
+    block_size = finest_block
+    for _ in range(n_levels):
+        if block_size in block_sizes:
+            break
+        block_sizes.append(block_size)
+        if block_size >= signal.size:
+            break
+        block_size *= 4
+
+    levels = []
+    for block_size in block_sizes:
+        mins, maxs = _signal_minmax(signal, block_size)
+        levels.append(
+            {
+                "block_size_samples": int(block_size),
+                "mins_b64": _encode_int16_base64(_quantize_signal(mins, value_min, value_max)),
+                "maxs_b64": _encode_int16_base64(_quantize_signal(maxs, value_min, value_max)),
+            }
+        )
+
+    return {
+        "sample_count": int(signal.size),
+        "value_min": value_min,
+        "value_max": value_max,
+        "levels": levels,
+    }
+
+
+def create_interactive_session_view(
+    session_name: str,
+    source_name: str,
+    preprocess_result: PreprocessResult,
+    windows: WindowResult,
+    labels_by_method: dict[str, np.ndarray],
+    output_dir: Path,
+    default_method: str,
+) -> list[Path]:
+    output_dir = ensure_dir(output_dir)
+    all_labels = np.concatenate([labels.astype(int) for labels in labels_by_method.values()]) if labels_by_method else np.array([0], dtype=int)
+    n_states = int(all_labels.max()) + 1 if all_labels.size else 1
+    palette = [PALETTE[idx % len(PALETTE)] for idx in range(max(n_states, 1))]
+
+    payload = {
+        "session_name": session_name,
+        "source_name": source_name,
+        "fs": float(preprocess_result.raw.fs),
+        "duration_sec": float(preprocess_result.raw.eeg.size / preprocess_result.raw.fs) if preprocess_result.raw.eeg.size else 0.0,
+        "sample_count": int(preprocess_result.raw.eeg.size),
+        "window_sec": float(windows.window_sec),
+        "epoch_starts_sec": windows.start_times.astype(float).round(6).tolist(),
+        "epoch_centers_sec": (windows.start_times.astype(float) + windows.window_sec / 2.0).round(6).tolist(),
+        "method_order": list(labels_by_method.keys()),
+        "default_background_method": default_method if default_method in labels_by_method else next(iter(labels_by_method), "kmeans"),
+        "cluster_colors": palette,
+        "methods": {name: labels.astype(int).tolist() for name, labels in labels_by_method.items()},
+        "signals": {
+            "eeg": {
+                "title": "EEG",
+                **_build_signal_levels(preprocess_result.raw.eeg),
+            },
+            "emg": None
+            if preprocess_result.raw.emg is None
+            else {
+                "title": "EMG",
+                **_build_signal_levels(preprocess_result.raw.emg),
+            },
+        },
+    }
+    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    html_template = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>__TITLE__</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f7f2;
+      --panel: #ffffff;
+      --ink: #10212b;
+      --muted: #5f6b76;
+      --border: #d6dde3;
+      --accent: #0b4f6c;
+      --accent-2: #b80c09;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #eff5f6 0%, var(--bg) 45%, #fbfaf4 100%);
+      color: var(--ink);
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    .page {
+      max-width: 1480px;
+      margin: 0 auto;
+      padding: 18px 18px 28px;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 14px;
+    }
+    .title h1 {
+      margin: 0 0 6px;
+      font-size: 28px;
+      line-height: 1.15;
+    }
+    .title p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .toolbar, .info-card, .panel {
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 10px 24px rgba(16, 33, 43, 0.06);
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 10px;
+      align-items: center;
+      padding: 12px 14px;
+      margin-bottom: 12px;
+    }
+    .toolbar button, .toolbar select {
+      border: 1px solid #bfd0d8;
+      border-radius: 10px;
+      background: white;
+      padding: 8px 12px;
+      color: var(--ink);
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .toolbar .range {
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 330px;
+      gap: 14px;
+    }
+    .stack {
+      display: grid;
+      gap: 12px;
+    }
+    .panel {
+      padding: 10px;
+    }
+    .panel canvas {
+      width: 100%;
+      display: block;
+      border-radius: 10px;
+      background: #fffdfa;
+    }
+    .panel-label {
+      margin: 0 0 8px;
+      font-size: 13px;
+      color: var(--muted);
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+    .info-card {
+      padding: 14px;
+      align-self: start;
+      position: sticky;
+      top: 18px;
+    }
+    .info-card h2 {
+      margin: 0 0 10px;
+      font-size: 18px;
+    }
+    .info-card dl {
+      margin: 0;
+      display: grid;
+      gap: 10px;
+    }
+    .info-card dt {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .info-card dd {
+      margin: 3px 0 0;
+      font-size: 15px;
+      font-variant-numeric: tabular-nums;
+    }
+    .method-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 13px;
+    }
+    .method-table th, .method-table td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #e5eaee;
+      text-align: left;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .swatch {
+      width: 11px;
+      height: 11px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+    .hint {
+      margin-top: 12px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    @media (max-width: 1100px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+      .info-card {
+        position: static;
+      }
+      .toolbar .range {
+        margin-left: 0;
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div class="title">
+        <h1 id="session-title">Interactive EEG/EMG Session</h1>
+        <p id="session-subtitle"></p>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <button id="zoom-in">Zoom In</button>
+      <button id="zoom-out">Zoom Out</button>
+      <button id="pan-left">Pan Left</button>
+      <button id="pan-right">Pan Right</button>
+      <button id="show-full">Show Full</button>
+      <button id="go-selected">Center Selected Epoch</button>
+      <label for="method-select">Background Cluster</label>
+      <select id="method-select"></select>
+      <div class="range" id="range-label"></div>
+    </div>
+
+    <div class="grid">
+      <div class="stack">
+        <div class="panel">
+          <p class="panel-label">Overview</p>
+          <canvas id="overview-canvas" height="110"></canvas>
+        </div>
+        <div class="panel">
+          <p class="panel-label">EEG</p>
+          <canvas id="eeg-canvas" height="230"></canvas>
+        </div>
+        <div class="panel" id="emg-panel">
+          <p class="panel-label">EMG</p>
+          <canvas id="emg-canvas" height="200"></canvas>
+        </div>
+        <div class="panel">
+          <p class="panel-label">Cluster Timeline</p>
+          <canvas id="cluster-canvas" height="210"></canvas>
+        </div>
+      </div>
+
+      <aside class="info-card">
+        <h2>Epoch Traceback</h2>
+        <dl>
+          <div>
+            <dt>Session</dt>
+            <dd id="info-session"></dd>
+          </div>
+          <div>
+            <dt>Selected Epoch</dt>
+            <dd id="info-epoch"></dd>
+          </div>
+          <div>
+            <dt>Epoch Range</dt>
+            <dd id="info-range"></dd>
+          </div>
+          <div>
+            <dt>Current View</dt>
+            <dd id="info-view"></dd>
+          </div>
+        </dl>
+        <table class="method-table">
+          <thead>
+            <tr><th>Method</th><th>State</th></tr>
+          </thead>
+          <tbody id="method-state-body"></tbody>
+        </table>
+        <div class="hint">
+          Click an epoch on the cluster timeline to trace it back to the raw EEG/EMG panels. Mouse wheel zooms around the cursor position, and dragging inside EEG/EMG or cluster panels pans the time range synchronously.
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    const DATA = __SESSION_DATA__;
+
+    function decodeInt16(base64Text) {
+      const binary = atob(base64Text);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      return new Int16Array(bytes.buffer);
+    }
+
+    function hexToRgba(hex, alpha) {
+      const clean = hex.replace("#", "");
+      const r = parseInt(clean.slice(0, 2), 16);
+      const g = parseInt(clean.slice(2, 4), 16);
+      const b = parseInt(clean.slice(4, 6), 16);
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+
+    function formatTime(totalSeconds) {
+      const seconds = Math.max(0, Number(totalSeconds) || 0);
+      const hh = Math.floor(seconds / 3600);
+      const mm = Math.floor((seconds % 3600) / 60);
+      const ss = seconds % 60;
+      return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${ss.toFixed(1).padStart(4, "0")}`;
+    }
+
+    function lowerBound(values, target) {
+      let low = 0;
+      let high = values.length;
+      while (low < high) {
+        const mid = Math.floor((low + high) / 2);
+        if (values[mid] < target) low = mid + 1;
+        else high = mid;
+      }
+      return low;
+    }
+
+    function nearestEpochIndex(sec) {
+      if (!DATA.epoch_centers_sec.length) return 0;
+      const idx = lowerBound(DATA.epoch_centers_sec, sec);
+      if (idx <= 0) return 0;
+      if (idx >= DATA.epoch_centers_sec.length) return DATA.epoch_centers_sec.length - 1;
+      const left = DATA.epoch_centers_sec[idx - 1];
+      const right = DATA.epoch_centers_sec[idx];
+      return Math.abs(sec - left) <= Math.abs(sec - right) ? idx - 1 : idx;
+    }
+
+    function getLabels(methodName) {
+      return DATA.methods[methodName] || DATA.methods[DATA.method_order[0]];
+    }
+
+    function dequantize(q, signal) {
+      const span = signal.value_max - signal.value_min;
+      if (Math.abs(span) < 1e-12) return signal.value_min;
+      return signal.value_min + ((q + 32768) / 65535) * span;
+    }
+
+    function decodeSignalLevels(signal) {
+      if (!signal) return null;
+      signal.levels.forEach((level) => {
+        level.mins = decodeInt16(level.mins_b64);
+        level.maxs = decodeInt16(level.maxs_b64);
+        delete level.mins_b64;
+        delete level.maxs_b64;
+      });
+      return signal;
+    }
+
+    DATA.signals.eeg = decodeSignalLevels(DATA.signals.eeg);
+    DATA.signals.emg = decodeSignalLevels(DATA.signals.emg);
+
+    const defaultSpan = Math.min(DATA.duration_sec || DATA.window_sec, Math.max(600, DATA.window_sec * 20));
+    const state = {
+      backgroundMethod: DATA.default_background_method,
+      selectedEpoch: 0,
+      viewStartSec: 0,
+      viewEndSec: Math.min(DATA.duration_sec, defaultSpan),
+      isDragging: false,
+      dragOriginX: 0,
+      dragViewStart: 0,
+      dragViewEnd: 0,
+      dragCanvas: null,
+    };
+
+    const canvases = {
+      overview: document.getElementById("overview-canvas"),
+      eeg: document.getElementById("eeg-canvas"),
+      emg: document.getElementById("emg-canvas"),
+      cluster: document.getElementById("cluster-canvas"),
+    };
+
+    const emgPanel = document.getElementById("emg-panel");
+    if (!DATA.signals.emg) emgPanel.style.display = "none";
+
+    document.getElementById("session-title").textContent = `Interactive Session: ${DATA.session_name}`;
+    document.getElementById("session-subtitle").textContent = `${DATA.source_name} | Duration ${formatTime(DATA.duration_sec)} | Window ${DATA.window_sec.toFixed(1)} s`;
+    document.getElementById("info-session").textContent = DATA.session_name;
+
+    const methodSelect = document.getElementById("method-select");
+    DATA.method_order.forEach((methodName) => {
+      const option = document.createElement("option");
+      option.value = methodName;
+      option.textContent = methodName;
+      if (methodName === state.backgroundMethod) option.selected = true;
+      methodSelect.appendChild(option);
+    });
+    methodSelect.addEventListener("change", (event) => {
+      state.backgroundMethod = event.target.value;
+      renderAll();
+    });
+
+    function setupCanvas(canvas) {
+      const ratio = window.devicePixelRatio || 1;
+      const bounds = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.floor(bounds.width * ratio));
+      canvas.height = Math.max(1, Math.floor((canvas.getAttribute("height") || bounds.height || 200) * ratio));
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      return { ctx, width: bounds.width, height: canvas.height / ratio };
+    }
+
+    function clampView(startSec, endSec) {
+      const minSpan = Math.max(DATA.window_sec * 1.2, Math.min(DATA.duration_sec, 10));
+      const duration = Math.max(DATA.duration_sec, minSpan);
+      let span = Math.max(minSpan, endSec - startSec);
+      if (span > duration) span = duration;
+      let start = startSec;
+      let end = start + span;
+      if (start < 0) {
+        start = 0;
+        end = span;
+      }
+      if (end > duration) {
+        end = duration;
+        start = Math.max(0, end - span);
+      }
+      state.viewStartSec = start;
+      state.viewEndSec = end;
+    }
+
+    function setView(startSec, endSec) {
+      clampView(startSec, endSec);
+      renderAll();
+    }
+
+    function zoom(factor, centerSec) {
+      const center = Number.isFinite(centerSec) ? centerSec : (state.viewStartSec + state.viewEndSec) / 2;
+      const span = state.viewEndSec - state.viewStartSec;
+      const newSpan = span * factor;
+      const ratio = span > 0 ? (center - state.viewStartSec) / span : 0.5;
+      setView(center - newSpan * ratio, center + newSpan * (1 - ratio));
+    }
+
+    function pan(fraction) {
+      const span = state.viewEndSec - state.viewStartSec;
+      const shift = span * fraction;
+      setView(state.viewStartSec + shift, state.viewEndSec + shift);
+    }
+
+    function ensureEpochVisible(epochIndex) {
+      const start = DATA.epoch_starts_sec[epochIndex] || 0;
+      const end = start + DATA.window_sec;
+      const span = state.viewEndSec - state.viewStartSec;
+      if (start >= state.viewStartSec && end <= state.viewEndSec) return;
+      const center = (start + end) / 2;
+      setView(center - span / 2, center + span / 2);
+    }
+
+    function selectEpoch(epochIndex, keepView = false) {
+      state.selectedEpoch = Math.max(0, Math.min(DATA.epoch_starts_sec.length - 1, epochIndex));
+      if (!keepView) ensureEpochVisible(state.selectedEpoch);
+      else renderAll();
+    }
+
+    function currentPlotRect(width, height, leftMargin) {
+      return {
+        left: leftMargin,
+        right: width - 12,
+        top: 14,
+        bottom: height - 22,
+        width: Math.max(10, width - leftMargin - 12),
+        height: Math.max(10, height - 36),
+      };
+    }
+
+    function drawEpochBackgrounds(ctx, plot, labels) {
+      const startIdx = Math.max(0, lowerBound(DATA.epoch_starts_sec, state.viewStartSec + 1e-9) - 1);
+      const endIdx = Math.min(DATA.epoch_starts_sec.length - 1, lowerBound(DATA.epoch_starts_sec, state.viewEndSec + DATA.window_sec));
+      for (let idx = startIdx; idx <= endIdx; idx += 1) {
+        const epochStart = DATA.epoch_starts_sec[idx];
+        const epochEnd = epochStart + DATA.window_sec;
+        const x0 = plot.left + ((epochStart - state.viewStartSec) / (state.viewEndSec - state.viewStartSec)) * plot.width;
+        const x1 = plot.left + ((epochEnd - state.viewStartSec) / (state.viewEndSec - state.viewStartSec)) * plot.width;
+        ctx.fillStyle = hexToRgba(DATA.cluster_colors[labels[idx] % DATA.cluster_colors.length], idx === state.selectedEpoch ? 0.22 : 0.11);
+        ctx.fillRect(x0, plot.top, Math.max(1, x1 - x0), plot.height);
+      }
+      if (state.selectedEpoch < DATA.epoch_starts_sec.length) {
+        const selectedStart = DATA.epoch_starts_sec[state.selectedEpoch];
+        const selectedEnd = selectedStart + DATA.window_sec;
+        const x0 = plot.left + ((selectedStart - state.viewStartSec) / (state.viewEndSec - state.viewStartSec)) * plot.width;
+        const x1 = plot.left + ((selectedEnd - state.viewStartSec) / (state.viewEndSec - state.viewStartSec)) * plot.width;
+        ctx.strokeStyle = hexToRgba("#b80c09", 0.9);
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x0, plot.top + 1, Math.max(1, x1 - x0), plot.height - 2);
+      }
+    }
+
+    function pickSignalLevel(signal, pixelWidth) {
+      const visibleSamples = Math.max(1, Math.ceil((state.viewEndSec - state.viewStartSec) * DATA.fs));
+      const targetBars = Math.max(250, Math.floor(pixelWidth * 1.35));
+      for (const level of signal.levels) {
+        const visibleBins = Math.ceil(visibleSamples / level.block_size_samples);
+        if (visibleBins <= targetBars) return level;
+      }
+      return signal.levels[signal.levels.length - 1];
+    }
+
+    function drawSignalPanel(canvas, signal) {
+      const { ctx, width, height } = setupCanvas(canvas);
+      ctx.clearRect(0, 0, width, height);
+      const plot = currentPlotRect(width, height, 62);
+      const labels = getLabels(state.backgroundMethod);
+      drawEpochBackgrounds(ctx, plot, labels);
+
+      const level = pickSignalLevel(signal, plot.width);
+      const startSample = Math.max(0, Math.floor(state.viewStartSec * DATA.fs));
+      const endSample = Math.min(signal.sample_count, Math.ceil(state.viewEndSec * DATA.fs));
+      const firstBlock = Math.max(0, Math.floor(startSample / level.block_size_samples));
+      const lastBlock = Math.min(level.mins.length - 1, Math.ceil(endSample / level.block_size_samples));
+
+      let visibleMin = Number.POSITIVE_INFINITY;
+      let visibleMax = Number.NEGATIVE_INFINITY;
+      for (let idx = firstBlock; idx <= lastBlock; idx += 1) {
+        const localMin = dequantize(level.mins[idx], signal);
+        const localMax = dequantize(level.maxs[idx], signal);
+        if (localMin < visibleMin) visibleMin = localMin;
+        if (localMax > visibleMax) visibleMax = localMax;
+      }
+      if (!Number.isFinite(visibleMin) || !Number.isFinite(visibleMax)) {
+        visibleMin = signal.value_min;
+        visibleMax = signal.value_max;
+      }
+      const rawSpan = Math.max(visibleMax - visibleMin, 1e-6);
+      visibleMin -= rawSpan * 0.05;
+      visibleMax += rawSpan * 0.05;
+
+      ctx.strokeStyle = "#0f1720";
+      ctx.lineWidth = 1;
+      for (let idx = firstBlock; idx <= lastBlock; idx += 1) {
+        const blockStart = idx * level.block_size_samples;
+        const blockEnd = Math.min(signal.sample_count, blockStart + level.block_size_samples);
+        const centerSec = ((blockStart + blockEnd) * 0.5) / DATA.fs;
+        const x = plot.left + ((centerSec - state.viewStartSec) / (state.viewEndSec - state.viewStartSec)) * plot.width;
+        const yMin = plot.bottom - ((dequantize(level.mins[idx], signal) - visibleMin) / (visibleMax - visibleMin)) * plot.height;
+        const yMax = plot.bottom - ((dequantize(level.maxs[idx], signal) - visibleMin) / (visibleMax - visibleMin)) * plot.height;
+        ctx.beginPath();
+        ctx.moveTo(x, yMin);
+        ctx.lineTo(x, yMax);
+        ctx.stroke();
+      }
+
+      if (visibleMin < 0 && visibleMax > 0) {
+        const zeroY = plot.bottom - ((0 - visibleMin) / (visibleMax - visibleMin)) * plot.height;
+        ctx.strokeStyle = "rgba(11,79,108,0.3)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(plot.left, zeroY);
+        ctx.lineTo(plot.right, zeroY);
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = "#10212b";
+      ctx.font = "12px Segoe UI";
+      ctx.fillText(signal.title, plot.left, 12);
+      ctx.fillStyle = "#5f6b76";
+      ctx.fillText(`Visible amplitude: ${visibleMin.toFixed(2)} to ${visibleMax.toFixed(2)}`, plot.left + 80, 12);
+      ctx.fillText(formatTime(state.viewStartSec), plot.left, height - 4);
+      ctx.fillText(formatTime(state.viewEndSec), Math.max(plot.left, plot.right - 68), height - 4);
+    }
+
+    function drawClusterPanel() {
+      const { ctx, width, height } = setupCanvas(canvases.cluster);
+      ctx.clearRect(0, 0, width, height);
+      const left = 92;
+      const plot = currentPlotRect(width, height, left);
+      const rowHeight = plot.height / Math.max(DATA.method_order.length, 1);
+      const selectedX = plot.left + ((DATA.epoch_centers_sec[state.selectedEpoch] - state.viewStartSec) / (state.viewEndSec - state.viewStartSec)) * plot.width;
+
+      ctx.strokeStyle = "rgba(11,79,108,0.18)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(selectedX, plot.top);
+      ctx.lineTo(selectedX, plot.bottom);
+      ctx.stroke();
+
+      const startIdx = Math.max(0, lowerBound(DATA.epoch_centers_sec, state.viewStartSec) - 1);
+      const endIdx = Math.min(DATA.epoch_centers_sec.length - 1, lowerBound(DATA.epoch_centers_sec, state.viewEndSec + DATA.window_sec));
+
+      DATA.method_order.forEach((methodName, rowIndex) => {
+        const yCenter = plot.top + rowHeight * (rowIndex + 0.5);
+        ctx.fillStyle = methodName === state.backgroundMethod ? "#10212b" : "#5f6b76";
+        ctx.font = methodName === state.backgroundMethod ? "bold 12px Segoe UI" : "12px Segoe UI";
+        ctx.fillText(methodName, 12, yCenter + 4);
+
+        ctx.strokeStyle = "rgba(95,107,118,0.15)";
+        ctx.beginPath();
+        ctx.moveTo(plot.left, yCenter);
+        ctx.lineTo(plot.right, yCenter);
+        ctx.stroke();
+
+        const labels = DATA.methods[methodName];
+        for (let idx = startIdx; idx <= endIdx; idx += 1) {
+          const sec = DATA.epoch_centers_sec[idx];
+          if (sec < state.viewStartSec - DATA.window_sec || sec > state.viewEndSec + DATA.window_sec) continue;
+          const x = plot.left + ((sec - state.viewStartSec) / (state.viewEndSec - state.viewStartSec)) * plot.width;
+          const color = DATA.cluster_colors[labels[idx] % DATA.cluster_colors.length];
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.arc(x, yCenter, idx === state.selectedEpoch ? 5.5 : 4, 0, Math.PI * 2);
+          ctx.fill();
+          if (idx === state.selectedEpoch) {
+            ctx.strokeStyle = "#b80c09";
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+          }
+        }
+      });
+      ctx.fillStyle = "#5f6b76";
+      ctx.font = "12px Segoe UI";
+      ctx.fillText(formatTime(state.viewStartSec), plot.left, height - 4);
+      ctx.fillText(formatTime(state.viewEndSec), Math.max(plot.left, plot.right - 68), height - 4);
+    }
+
+    function drawOverview() {
+      const { ctx, width, height } = setupCanvas(canvases.overview);
+      ctx.clearRect(0, 0, width, height);
+      const plot = currentPlotRect(width, height, 12);
+      const labels = getLabels(state.backgroundMethod);
+      for (let idx = 0; idx < DATA.epoch_starts_sec.length; idx += 1) {
+        const x0 = plot.left + (DATA.epoch_starts_sec[idx] / DATA.duration_sec) * plot.width;
+        const x1 = plot.left + ((DATA.epoch_starts_sec[idx] + DATA.window_sec) / DATA.duration_sec) * plot.width;
+        ctx.fillStyle = hexToRgba(DATA.cluster_colors[labels[idx] % DATA.cluster_colors.length], 0.55);
+        ctx.fillRect(x0, plot.top + 10, Math.max(1, x1 - x0), plot.height - 20);
+      }
+      const selectedStart = DATA.epoch_starts_sec[state.selectedEpoch];
+      const selectedCenterX = plot.left + ((selectedStart + DATA.window_sec / 2) / DATA.duration_sec) * plot.width;
+      ctx.strokeStyle = "#b80c09";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(selectedCenterX, plot.top);
+      ctx.lineTo(selectedCenterX, plot.bottom);
+      ctx.stroke();
+
+      const viewX0 = plot.left + (state.viewStartSec / DATA.duration_sec) * plot.width;
+      const viewX1 = plot.left + (state.viewEndSec / DATA.duration_sec) * plot.width;
+      ctx.strokeStyle = "rgba(16,33,43,0.92)";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(viewX0, plot.top + 2, Math.max(2, viewX1 - viewX0), plot.height - 4);
+      ctx.fillStyle = "#5f6b76";
+      ctx.font = "12px Segoe UI";
+      ctx.fillText("Click to center the visible window", 12, 12);
+      ctx.fillText(formatTime(0), plot.left, height - 4);
+      ctx.fillText(formatTime(DATA.duration_sec), Math.max(plot.left, plot.right - 74), height - 4);
+    }
+
+    function updateInfo() {
+      const epochIdx = state.selectedEpoch;
+      const epochStart = DATA.epoch_starts_sec[epochIdx] || 0;
+      const epochEnd = epochStart + DATA.window_sec;
+      document.getElementById("range-label").textContent = `View ${formatTime(state.viewStartSec)} - ${formatTime(state.viewEndSec)} | Span ${(state.viewEndSec - state.viewStartSec).toFixed(1)} s`;
+      document.getElementById("info-epoch").textContent = `#${epochIdx}`;
+      document.getElementById("info-range").textContent = `${formatTime(epochStart)} - ${formatTime(epochEnd)}`;
+      document.getElementById("info-view").textContent = `${formatTime(state.viewStartSec)} - ${formatTime(state.viewEndSec)}`;
+      const body = document.getElementById("method-state-body");
+      body.innerHTML = "";
+      DATA.method_order.forEach((methodName) => {
+        const row = document.createElement("tr");
+        const stateCell = document.createElement("td");
+        const methodCell = document.createElement("td");
+        methodCell.textContent = methodName;
+        const badge = document.createElement("span");
+        badge.className = "badge";
+        const swatch = document.createElement("span");
+        swatch.className = "swatch";
+        const clusterState = DATA.methods[methodName][epochIdx];
+        swatch.style.background = DATA.cluster_colors[clusterState % DATA.cluster_colors.length];
+        const label = document.createElement("span");
+        label.textContent = `S${clusterState}`;
+        badge.appendChild(swatch);
+        badge.appendChild(label);
+        stateCell.appendChild(badge);
+        row.appendChild(methodCell);
+        row.appendChild(stateCell);
+        body.appendChild(row);
+      });
+    }
+
+    function renderAll() {
+      drawOverview();
+      drawSignalPanel(canvases.eeg, DATA.signals.eeg);
+      if (DATA.signals.emg) drawSignalPanel(canvases.emg, DATA.signals.emg);
+      drawClusterPanel();
+      updateInfo();
+    }
+
+    function timeFromCanvasEvent(canvas, event, leftMargin) {
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const plotWidth = Math.max(10, rect.width - leftMargin - 12);
+      const clamped = Math.min(Math.max(leftMargin, x), leftMargin + plotWidth);
+      const ratio = (clamped - leftMargin) / plotWidth;
+      return state.viewStartSec + ratio * (state.viewEndSec - state.viewStartSec);
+    }
+
+    function attachPanZoom(canvas, leftMargin) {
+      canvas.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        zoom(event.deltaY < 0 ? 0.75 : 1.35, timeFromCanvasEvent(canvas, event, leftMargin));
+      }, { passive: false });
+
+      canvas.addEventListener("mousedown", (event) => {
+        state.isDragging = true;
+        state.dragCanvas = canvas;
+        state.dragOriginX = event.clientX;
+        state.dragViewStart = state.viewStartSec;
+        state.dragViewEnd = state.viewEndSec;
+      });
+
+      canvas.addEventListener("dblclick", (event) => {
+        const sec = timeFromCanvasEvent(canvas, event, leftMargin);
+        selectEpoch(nearestEpochIndex(sec));
+      });
+    }
+
+    window.addEventListener("mousemove", (event) => {
+      if (!state.isDragging || !state.dragCanvas) return;
+      const rect = state.dragCanvas.getBoundingClientRect();
+      const leftMargin = state.dragCanvas === canvases.cluster ? 92 : 62;
+      const plotWidth = Math.max(10, rect.width - leftMargin - 12);
+      const dx = event.clientX - state.dragOriginX;
+      const shiftSec = -(dx / plotWidth) * (state.dragViewEnd - state.dragViewStart);
+      clampView(state.dragViewStart + shiftSec, state.dragViewEnd + shiftSec);
+      renderAll();
+    });
+
+    window.addEventListener("mouseup", () => {
+      state.isDragging = false;
+      state.dragCanvas = null;
+    });
+
+    canvases.cluster.addEventListener("click", (event) => {
+      const sec = timeFromCanvasEvent(canvases.cluster, event, 92);
+      selectEpoch(nearestEpochIndex(sec), true);
+      ensureEpochVisible(state.selectedEpoch);
+    });
+
+    canvases.overview.addEventListener("click", (event) => {
+      const rect = canvases.overview.getBoundingClientRect();
+      const x = Math.min(Math.max(12, event.clientX - rect.left), rect.width - 12);
+      const ratio = (x - 12) / Math.max(10, rect.width - 24);
+      const center = ratio * DATA.duration_sec;
+      const span = state.viewEndSec - state.viewStartSec;
+      setView(center - span / 2, center + span / 2);
+    });
+
+    attachPanZoom(canvases.eeg, 62);
+    if (DATA.signals.emg) attachPanZoom(canvases.emg, 62);
+    attachPanZoom(canvases.cluster, 92);
+
+    document.getElementById("zoom-in").addEventListener("click", () => zoom(0.5));
+    document.getElementById("zoom-out").addEventListener("click", () => zoom(2.0));
+    document.getElementById("pan-left").addEventListener("click", () => pan(-0.5));
+    document.getElementById("pan-right").addEventListener("click", () => pan(0.5));
+    document.getElementById("show-full").addEventListener("click", () => setView(0, DATA.duration_sec));
+    document.getElementById("go-selected").addEventListener("click", () => {
+      const center = DATA.epoch_centers_sec[state.selectedEpoch] || 0;
+      const span = Math.max(DATA.window_sec * 3, Math.min(state.viewEndSec - state.viewStartSec, 600));
+      setView(center - span / 2, center + span / 2);
+    });
+
+    window.addEventListener("resize", renderAll);
+    renderAll();
+  </script>
+</body>
+</html>
+"""
+
+    html_text = html_template.replace("__SESSION_DATA__", payload_json).replace("__TITLE__", html.escape(f"{session_name} Interactive Session"))
+    html_path = output_dir / "session_view.html"
+    html_path.write_text(html_text, encoding="utf-8")
+    return [html_path]

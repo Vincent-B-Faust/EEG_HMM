@@ -2,6 +2,8 @@
 
 基于 EEG/EMG 的无监督睡眠阶段聚类与动力学分析流水线，支持命令行执行和 Jupyter 交互式执行。
 
+默认情况下，文件输入的所有结果会输出到 `sessions/<输入文件名>/`，并额外生成一个可直接打开的交互式会话文件 `session_view.html`。
+
 ## 核心模块
 
 - `preprocess()`：EEG/EMG 滤波、工频抑制、标准化
@@ -98,7 +100,7 @@ python3 -m sleep_hmm.cli \
 运行内置合成数据：
 
 ```bash
-python3 -m sleep_hmm.cli --demo --output demo_outputs --fs 128 --k-user 3 --manifold pca
+python3 -m sleep_hmm.cli --demo --output sessions --fs 128 --k-user 3 --manifold pca
 ```
 
 运行 EDF：
@@ -108,7 +110,7 @@ python3 -m sleep_hmm.cli \
   --filename path/to/data.edf \
   --eeg-channel EEG \
   --emg-channel EMG \
-  --output outputs_edf \
+  --output sessions \
   --k-user 3 \
   --window-strategy notebook_auto \
   --acceleration-backend auto \
@@ -123,7 +125,7 @@ python3 -m sleep_hmm.cli \
   --fs 2000 \
   --csv-eeg-column eeg \
   --csv-emg-column emg \
-  --output outputs_csv \
+  --output sessions \
   --window-size 200 \
   --overlap 50 \
   --window-strategy samples
@@ -136,7 +138,7 @@ python3 -m sleep_hmm.cli \
   --filename path/to/data.mat \
   --fs 2000 \
   --mat-variable signal \
-  --output outputs_mat
+  --output sessions
 ```
 
 ## Jupyter 交互式执行
@@ -164,7 +166,7 @@ result = run_interactive(
     k_user=k_user,
     window_size=window_size,
     overlap=overlap,
-    output_dir="notebook_outputs",
+    output_dir="sessions",
     window_strategy="notebook_auto",
     acceleration_backend="auto",
     acceleration_device="auto",
@@ -183,8 +185,25 @@ result = run_interactive(
 - `hmm_model_comparison.csv`
 - 每种方法的 `*_feature_importance.csv`、`*_thresholds.csv`
 - `manifold_embedding.csv`
+- `session_view.html`
 - `report.md`
 - `figures/` 下的全部可视化图
+
+## 交互式 Session 视图
+
+对文件输入，系统会在 `sessions/<输入文件名>/session_view.html` 生成一个自包含的交互式会话页面。打开后可查看：
+
+- 全长 EEG / EMG 时间轴
+- 三种聚类方法的 epoch 级时间序列
+- 与 cluster 颜色一致的原始信号背景标注
+- 同步缩放、平移和 epoch 追踪
+
+交互方式：
+
+- 鼠标滚轮：围绕光标位置缩放
+- 在 EEG / EMG / cluster 面板中拖动：同步平移时间范围
+- 点击 cluster 时间轴中的 epoch：在原始信号中高亮并在右侧信息面板显示该 epoch 的三种聚类标签
+- 点击 overview 面板：将当前视窗居中到对应时间位置
 
 ## 依赖
 

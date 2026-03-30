@@ -23,7 +23,9 @@ class PipelineTestCase(unittest.TestCase):
             self.assertEqual(result.manifold.embedding.shape[1], 2)
             self.assertTrue((result.output_dir / "report.md").exists())
             self.assertTrue((result.output_dir / "hmm_model_comparison.csv").exists())
+            self.assertTrue((result.output_dir / "session_view.html").exists())
             self.assertGreater(len(result.artifact_paths["figures"]), 5)
+            self.assertEqual(len(result.artifact_paths["interactive"]), 1)
             self.assertIn("backend_used", result.runtime_info)
 
 

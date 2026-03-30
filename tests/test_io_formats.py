@@ -134,6 +134,8 @@ class IOFormatTestCase(unittest.TestCase):
             result = run_file_pipeline(csv_path, fs=fs, config=config)
             self.assertEqual(list(result.features.raw_table.columns), ["peak_to_peak", "zero_crossing_rate", "peak_count", "iemg2"])
             self.assertTrue((result.output_dir / "report.md").exists())
+            self.assertTrue((result.output_dir / "session_view.html").exists())
+            self.assertEqual(result.output_dir.name, "signals")
 
 
 if __name__ == "__main__":

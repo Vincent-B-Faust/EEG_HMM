@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,12 @@ def ensure_dir(path: Path | str) -> Path:
     directory = Path(path)
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def sanitize_session_name(name: str) -> str:
+    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1F]+', "_", name.strip())
+    sanitized = sanitized.strip(" ._")
+    return sanitized or "session"
 
 
 def to_serializable(value: Any) -> Any:

@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unsupervised sleep stage clustering and dynamics analysis.")
     parser.add_argument("--input", "--filename", dest="filename", type=str, help="Path to .edf/.csv/.mat/.npz/.npy input file.")
     parser.add_argument("--fs", type=float, default=None, help="Sampling rate, required for CSV/NPY/MAT inputs when it is not stored in file.")
-    parser.add_argument("--output", type=str, default="outputs", help="Output directory.")
+    parser.add_argument("--output", type=str, default="sessions", help="Output root directory; file inputs are saved under a session folder named after the input file.")
     parser.add_argument("--use-dask", action=argparse.BooleanOptionalAction, default=True, help="Notebook-compatible flag; current implementation uses vectorized NumPy path.")
     parser.add_argument("--k-user", "--clusters", dest="k_user", type=int, default=3, help="Number of clusters, compatible with the source notebook.")
     parser.add_argument("--window-size", type=int, default=None, help="Window size in samples, compatible with the source notebook.")
