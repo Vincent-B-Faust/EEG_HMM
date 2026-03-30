@@ -295,6 +295,8 @@ def run_pipeline(
         source_name=cfg.input.filename or output_dir.name,
         preprocess_result=preprocess_result,
         windows=windows,
+        embedding=manifold_result.embedding,
+        manifold_method=manifold_result.method_used,
         labels_by_method=aligned_labels,
         output_dir=output_dir,
         default_method=alignment.reference_method,

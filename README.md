@@ -194,15 +194,15 @@ result = run_interactive(
 对文件输入，系统会在 `sessions/<输入文件名>/session_view.html` 生成一个自包含的交互式会话页面。打开后可查看：
 
 - 全长 EEG / EMG 时间轴
-- 三种聚类方法的 epoch 级时间序列
+- 基于降维流形的 cluster 散点图
 - 与 cluster 颜色一致的原始信号背景标注
 - 同步缩放、平移和 epoch 追踪
 
 交互方式：
 
 - 鼠标滚轮：围绕光标位置缩放
-- 在 EEG / EMG / cluster 面板中拖动：同步平移时间范围
-- 点击 cluster 时间轴中的 epoch：在原始信号中高亮并在右侧信息面板显示该 epoch 的三种聚类标签
+- 在 EEG / EMG 面板中拖动：同步平移时间范围
+- 点击 manifold 散点图中的任一点：在原始信号中高亮并在右侧信息面板显示该 epoch 的三种聚类标签
 - 点击 overview 面板：将当前视窗居中到对应时间位置
 
 ## 依赖

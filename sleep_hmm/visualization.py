@@ -576,6 +576,8 @@ def create_interactive_session_view(
     source_name: str,
     preprocess_result: PreprocessResult,
     windows: WindowResult,
+    embedding: np.ndarray,
+    manifold_method: str,
     labels_by_method: dict[str, np.ndarray],
     output_dir: Path,
     default_method: str,
@@ -592,8 +594,10 @@ def create_interactive_session_view(
         "duration_sec": float(preprocess_result.raw.eeg.size / preprocess_result.raw.fs) if preprocess_result.raw.eeg.size else 0.0,
         "sample_count": int(preprocess_result.raw.eeg.size),
         "window_sec": float(windows.window_sec),
+        "manifold_method": manifold_method,
         "epoch_starts_sec": windows.start_times.astype(float).round(6).tolist(),
         "epoch_centers_sec": (windows.start_times.astype(float) + windows.window_sec / 2.0).round(6).tolist(),
+        "embedding": np.asarray(embedding[:, :2], dtype=float).round(6).tolist() if embedding.size else [],
         "method_order": list(labels_by_method.keys()),
         "default_background_method": default_method if default_method in labels_by_method else next(iter(labels_by_method), "kmeans"),
         "cluster_colors": palette,
@@ -819,7 +823,7 @@ def create_interactive_session_view(
           <canvas id="emg-canvas" height="200"></canvas>
         </div>
         <div class="panel">
-          <p class="panel-label">Cluster Timeline</p>
+          <p class="panel-label">Cluster Scatter</p>
           <canvas id="cluster-canvas" height="210"></canvas>
         </div>
       </div>
@@ -843,6 +847,10 @@ def create_interactive_session_view(
             <dt>Current View</dt>
             <dd id="info-view"></dd>
           </div>
+          <div>
+            <dt>Manifold</dt>
+            <dd id="info-manifold"></dd>
+          </div>
         </dl>
         <table class="method-table">
           <thead>
@@ -851,7 +859,7 @@ def create_interactive_session_view(
           <tbody id="method-state-body"></tbody>
         </table>
         <div class="hint">
-          Click an epoch on the cluster timeline to trace it back to the raw EEG/EMG panels. Mouse wheel zooms around the cursor position, and dragging inside EEG/EMG or cluster panels pans the time range synchronously.
+          Click a point on the manifold scatter to trace that epoch back to the raw EEG/EMG panels. Mouse wheel zooms around the cursor position, and dragging inside EEG/EMG panels pans the time range synchronously.
         </div>
       </aside>
     </div>
@@ -927,6 +935,26 @@ def create_interactive_session_view(
 
     DATA.signals.eeg = decodeSignalLevels(DATA.signals.eeg);
     DATA.signals.emg = decodeSignalLevels(DATA.signals.emg);
+    DATA.embedding = (DATA.embedding || []).map((item) => [Number(item[0]) || 0, Number(item[1]) || 0]);
+
+    const manifoldBounds = (() => {
+      if (!DATA.embedding.length) {
+        return { minX: -1, maxX: 1, minY: -1, maxY: 1 };
+      }
+      let minX = Number.POSITIVE_INFINITY;
+      let maxX = Number.NEGATIVE_INFINITY;
+      let minY = Number.POSITIVE_INFINITY;
+      let maxY = Number.NEGATIVE_INFINITY;
+      for (const [x, y] of DATA.embedding) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+      const padX = Math.max((maxX - minX) * 0.08, 1e-6);
+      const padY = Math.max((maxY - minY) * 0.08, 1e-6);
+      return { minX: minX - padX, maxX: maxX + padX, minY: minY - padY, maxY: maxY + padY };
+    })();
 
     const defaultSpan = Math.min(DATA.duration_sec || DATA.window_sec, Math.max(600, DATA.window_sec * 20));
     const state = {
@@ -939,6 +967,7 @@ def create_interactive_session_view(
       dragViewStart: 0,
       dragViewEnd: 0,
       dragCanvas: null,
+      scatterPoints: [],
     };
 
     const canvases = {
@@ -1042,6 +1071,21 @@ def create_interactive_session_view(
       };
     }
 
+    function isEpochInView(epochIndex) {
+      const start = DATA.epoch_starts_sec[epochIndex] || 0;
+      const end = start + DATA.window_sec;
+      return end >= state.viewStartSec && start <= state.viewEndSec;
+    }
+
+    function manifoldToCanvas(point, plot) {
+      const xRatio = (point[0] - manifoldBounds.minX) / Math.max(manifoldBounds.maxX - manifoldBounds.minX, 1e-9);
+      const yRatio = (point[1] - manifoldBounds.minY) / Math.max(manifoldBounds.maxY - manifoldBounds.minY, 1e-9);
+      return {
+        x: plot.left + xRatio * plot.width,
+        y: plot.bottom - yRatio * plot.height,
+      };
+    }
+
     function drawEpochBackgrounds(ctx, plot, labels) {
       const startIdx = Math.max(0, lowerBound(DATA.epoch_starts_sec, state.viewStartSec + 1e-9) - 1);
       const endIdx = Math.min(DATA.epoch_starts_sec.length - 1, lowerBound(DATA.epoch_starts_sec, state.viewEndSec + DATA.window_sec));
@@ -1140,54 +1184,76 @@ def create_interactive_session_view(
     function drawClusterPanel() {
       const { ctx, width, height } = setupCanvas(canvases.cluster);
       ctx.clearRect(0, 0, width, height);
-      const left = 92;
-      const plot = currentPlotRect(width, height, left);
-      const rowHeight = plot.height / Math.max(DATA.method_order.length, 1);
-      const selectedX = plot.left + ((DATA.epoch_centers_sec[state.selectedEpoch] - state.viewStartSec) / (state.viewEndSec - state.viewStartSec)) * plot.width;
+      const plot = currentPlotRect(width, height, 46);
+      const labels = getLabels(state.backgroundMethod);
+      state.scatterPoints = [];
 
-      ctx.strokeStyle = "rgba(11,79,108,0.18)";
+      ctx.strokeStyle = "rgba(16,33,43,0.12)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(plot.left, plot.top, plot.width, plot.height);
+
+      if (!DATA.embedding.length) {
+        ctx.fillStyle = "#5f6b76";
+        ctx.font = "13px Segoe UI";
+        ctx.fillText("No manifold embedding available.", plot.left + 12, plot.top + 20);
+        return;
+      }
+
+      const stride = Math.max(1, Math.floor(DATA.embedding.length / 4000));
+      ctx.strokeStyle = "rgba(109,114,120,0.28)";
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(selectedX, plot.top);
-      ctx.lineTo(selectedX, plot.bottom);
+      let moved = false;
+      for (let idx = 0; idx < DATA.embedding.length; idx += stride) {
+        const point = manifoldToCanvas(DATA.embedding[idx], plot);
+        if (!moved) {
+          ctx.moveTo(point.x, point.y);
+          moved = true;
+        } else {
+          ctx.lineTo(point.x, point.y);
+        }
+      }
       ctx.stroke();
 
-      const startIdx = Math.max(0, lowerBound(DATA.epoch_centers_sec, state.viewStartSec) - 1);
-      const endIdx = Math.min(DATA.epoch_centers_sec.length - 1, lowerBound(DATA.epoch_centers_sec, state.viewEndSec + DATA.window_sec));
-
-      DATA.method_order.forEach((methodName, rowIndex) => {
-        const yCenter = plot.top + rowHeight * (rowIndex + 0.5);
-        ctx.fillStyle = methodName === state.backgroundMethod ? "#10212b" : "#5f6b76";
-        ctx.font = methodName === state.backgroundMethod ? "bold 12px Segoe UI" : "12px Segoe UI";
-        ctx.fillText(methodName, 12, yCenter + 4);
-
-        ctx.strokeStyle = "rgba(95,107,118,0.15)";
+      for (let idx = 0; idx < DATA.embedding.length; idx += 1) {
+        const point = manifoldToCanvas(DATA.embedding[idx], plot);
+        state.scatterPoints.push({ index: idx, x: point.x, y: point.y });
+        const selected = idx === state.selectedEpoch;
+        const inView = isEpochInView(idx);
+        const color = DATA.cluster_colors[labels[idx] % DATA.cluster_colors.length];
+        const radius = selected ? 6.2 : (inView ? 4.1 : 2.8);
+        ctx.fillStyle = hexToRgba(color, selected ? 1.0 : (inView ? 0.92 : 0.34));
         ctx.beginPath();
-        ctx.moveTo(plot.left, yCenter);
-        ctx.lineTo(plot.right, yCenter);
-        ctx.stroke();
-
-        const labels = DATA.methods[methodName];
-        for (let idx = startIdx; idx <= endIdx; idx += 1) {
-          const sec = DATA.epoch_centers_sec[idx];
-          if (sec < state.viewStartSec - DATA.window_sec || sec > state.viewEndSec + DATA.window_sec) continue;
-          const x = plot.left + ((sec - state.viewStartSec) / (state.viewEndSec - state.viewStartSec)) * plot.width;
-          const color = DATA.cluster_colors[labels[idx] % DATA.cluster_colors.length];
-          ctx.fillStyle = color;
-          ctx.beginPath();
-          ctx.arc(x, yCenter, idx === state.selectedEpoch ? 5.5 : 4, 0, Math.PI * 2);
-          ctx.fill();
-          if (idx === state.selectedEpoch) {
-            ctx.strokeStyle = "#b80c09";
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-          }
+        ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        if (inView || selected) {
+          ctx.strokeStyle = selected ? "#b80c09" : "rgba(255,255,255,0.82)";
+          ctx.lineWidth = selected ? 2.0 : 1.0;
+          ctx.stroke();
         }
-      });
-      ctx.fillStyle = "#5f6b76";
+      }
+
+      const selectedPoint = manifoldToCanvas(DATA.embedding[state.selectedEpoch], plot);
+      ctx.strokeStyle = "rgba(184,12,9,0.45)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(selectedPoint.x, plot.top);
+      ctx.lineTo(selectedPoint.x, plot.bottom);
+      ctx.moveTo(plot.left, selectedPoint.y);
+      ctx.lineTo(plot.right, selectedPoint.y);
+      ctx.stroke();
+
+      ctx.fillStyle = "#10212b";
       ctx.font = "12px Segoe UI";
-      ctx.fillText(formatTime(state.viewStartSec), plot.left, height - 4);
-      ctx.fillText(formatTime(state.viewEndSec), Math.max(plot.left, plot.right - 68), height - 4);
+      ctx.fillText(`Scatter colored by ${state.backgroundMethod}`, plot.left, 12);
+      ctx.fillStyle = "#5f6b76";
+      ctx.fillText(`Manifold: ${DATA.manifold_method}`, plot.left + 150, 12);
+      ctx.fillText("Dim 1", plot.left, height - 4);
+      ctx.save();
+      ctx.translate(12, plot.bottom);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText("Dim 2", 0, 0);
+      ctx.restore();
     }
 
     function drawOverview() {
@@ -1230,6 +1296,7 @@ def create_interactive_session_view(
       document.getElementById("info-epoch").textContent = `#${epochIdx}`;
       document.getElementById("info-range").textContent = `${formatTime(epochStart)} - ${formatTime(epochEnd)}`;
       document.getElementById("info-view").textContent = `${formatTime(state.viewStartSec)} - ${formatTime(state.viewEndSec)}`;
+      document.getElementById("info-manifold").textContent = DATA.manifold_method;
       const body = document.getElementById("method-state-body");
       body.innerHTML = "";
       DATA.method_order.forEach((methodName) => {
@@ -1294,7 +1361,7 @@ def create_interactive_session_view(
     window.addEventListener("mousemove", (event) => {
       if (!state.isDragging || !state.dragCanvas) return;
       const rect = state.dragCanvas.getBoundingClientRect();
-      const leftMargin = state.dragCanvas === canvases.cluster ? 92 : 62;
+      const leftMargin = 62;
       const plotWidth = Math.max(10, rect.width - leftMargin - 12);
       const dx = event.clientX - state.dragOriginX;
       const shiftSec = -(dx / plotWidth) * (state.dragViewEnd - state.dragViewStart);
@@ -1308,9 +1375,21 @@ def create_interactive_session_view(
     });
 
     canvases.cluster.addEventListener("click", (event) => {
-      const sec = timeFromCanvasEvent(canvases.cluster, event, 92);
-      selectEpoch(nearestEpochIndex(sec), true);
-      ensureEpochVisible(state.selectedEpoch);
+      const rect = canvases.cluster.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      let bestIndex = -1;
+      let bestDistance = 18 * 18;
+      for (const point of state.scatterPoints) {
+        const dx = x - point.x;
+        const dy = y - point.y;
+        const dist2 = dx * dx + dy * dy;
+        if (dist2 < bestDistance) {
+          bestDistance = dist2;
+          bestIndex = point.index;
+        }
+      }
+      if (bestIndex >= 0) selectEpoch(bestIndex);
     });
 
     canvases.overview.addEventListener("click", (event) => {
@@ -1324,7 +1403,6 @@ def create_interactive_session_view(
 
     attachPanZoom(canvases.eeg, 62);
     if (DATA.signals.emg) attachPanZoom(canvases.emg, 62);
-    attachPanZoom(canvases.cluster, 92);
 
     document.getElementById("zoom-in").addEventListener("click", () => zoom(0.5));
     document.getElementById("zoom-out").addEventListener("click", () => zoom(2.0));
