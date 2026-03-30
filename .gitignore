@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+tmp_outputs/
+tmp_outputs_run2/
+tmp_cli_check/
+tmp_gpu_cli_check/
+tmp_hmm_cli_check/
+
+*.log
