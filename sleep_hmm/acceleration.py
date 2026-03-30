@@ -46,7 +46,10 @@ class AccelerationRuntime:
         if self.torch_module is None:
             raise RuntimeError("Torch runtime is not available.")
         dtype = self.torch_module.float32 if self.config.dtype == "float32" else self.torch_module.float64
-        return self.torch_module.as_tensor(array, dtype=dtype, device=self.device_used)
+        array_safe = np.asarray(array)
+        if not array_safe.flags.writeable or not array_safe.flags.c_contiguous:
+            array_safe = np.array(array_safe, copy=True, order="C")
+        return self.torch_module.as_tensor(array_safe, dtype=dtype, device=self.device_used)
 
     def to_numpy(self, tensor: Any) -> np.ndarray:
         if self.torch_module is None:
